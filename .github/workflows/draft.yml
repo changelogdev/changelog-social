@@ -1,0 +1,52 @@
+name: Draft
+
+# Mondays after the paper publishes (10:00 KST). Tries three times in case the
+# issue is slow; drafts each issue only once, then sends it to Telegram.
+on:
+  schedule:
+    - cron: "30 2 * * 1"   # 11:30 KST
+    - cron: "30 4 * * 1"   # 13:30 KST
+    - cron: "30 7 * * 1"   # 16:30 KST, last try: says so on Telegram if still not ready
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Use the test issue (No. 1) instead of the newest"
+        type: boolean
+        default: false
+      force:
+        description: "Redo the draft even if one exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: changelog-social
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Load saved progress
+        run: bash state.sh load
+      - name: Draft the thread
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          CHANGELOG_SCHEDULE_ID: ${{ vars.CHANGELOG_SCHEDULE_ID }}
+        run: |
+          args=""
+          if [ "${{ inputs.test }}" = "true" ]; then args="$args --test"; fi
+          if [ "${{ inputs.force }}" = "true" ]; then args="$args --force"; fi
+          if [ "${{ github.event.schedule }}" = "30 7 * * 1" ]; then args="$args --notify-not-ready"; fi
+          python changelog_social.py draft $args
+      - name: Save progress
+        if: always()
+        run: bash state.sh save
