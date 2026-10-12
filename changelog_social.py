@@ -173,16 +173,19 @@ def compose(issue):
     lead = issue.get("lead") or {}
     posts = []
 
-    posts.append(fit(
-        f"📰 CHANGELOG.md No. {no} is out: the week of {week} on the IMD swarm, in plain English.\n\n"
-        f"{clean(lead.get('headline'))}\n\n{clean(lead.get('standfirst'))}"))
+    first = (f"📰 CHANGELOG.md No. {no} is out: the week of {week} on the IMD swarm, in plain English 🧵\n\n"
+             f"{clean(lead.get('headline'))}")
+    with_sub = f"{first}\n\n{clean(lead.get('standfirst'))}"
+    posts.append(with_sub if weighted_len(with_sub) <= 280 else fit(first))
 
     new = bullets("🆕 New this week", [n.get("headline") for n in issue.get("new", [])][:4])
     if new:
         posts.append(new)
 
     bugs = [f"{b.get('headline')} ({str(b.get('severity', '')).lower()})" for b in issue.get("bugs", [])][:3]
-    bug_post = bullets("🐞 Caught before anyone got hurt", bugs)
+    bug_post = bullets("🐞 Caught before launch", bugs, limit=280 - 60)
+    if bug_post:
+        bug_post += "\n\nAll caught by the swarm's AI review panel before release."
     if bug_post:
         posts.append(bug_post)
 
@@ -493,11 +496,12 @@ def process_replies(st):
             continue
         try:
             if item["kind"] == "weekly":
-                if custom:
-                    telegram("Weekly threads can't be rewritten here; edit the draft on GitHub, then reply ✅.",
+                mine = [p.strip() for p in re.split(r"\n\s*---\s*\n", custom)] if custom else None
+                if mine and check(mine):
+                    telegram("Not posted: " + "; ".join(check(mine)) + ". Fix it and reply again.",
                              reply_to=m.get("message_id"))
                     continue
-                post_issue(item["no"])
+                post_issue(item["no"], posts=mine)
             else:
                 st["day"]["count"] += 1
                 post_single(custom or item["text"], item.get("why", "approved"), st)
@@ -641,7 +645,8 @@ def cmd_draft(args):
         tail = "\n\n⚠️ Checks failed, so this can't be posted as is: " + "; ".join(problems)
     else:
         tail = ("\n\n✅ Checks passed. Reply ✅ to this message to post it (it goes out at the next check, "
-                f"within 30 minutes), ❌ to skip, or run Post on GitHub: {repo_link('/actions/workflows/post.yml')}")
+                "within 30 minutes), ❌ to skip, or reply post: followed by your own thread, with a line "
+                f"containing just --- between posts. Or run Post on GitHub: {repo_link('/actions/workflows/post.yml')}")
     msg = telegram(head + preview + tail)
     if msg and not problems:
         pending = load_json(PENDING, {})
@@ -660,13 +665,17 @@ def cmd_post(args):
     return post_issue(no, dry_run=args.dry_run, force=args.force)
 
 
-def post_issue(no, dry_run=False, force=False):
+def post_issue(no, dry_run=False, force=False, posts=None):
     state = load_posted()
     prev = state.get(str(no))
     if prev and prev.get("complete", True) and not force:
         print(f"Issue {no} was already posted: {prev['url']}")
         return 0
-    draft = json.loads((DRAFTS / f"{no:03d}.json").read_text())
+    path = DRAFTS / f"{no:03d}.json"
+    draft = json.loads(path.read_text())
+    if posts:  # your own wording replaces the drafted thread
+        draft["posts"], draft["edited"] = posts, True
+        path.write_text(json.dumps(draft, indent=2, ensure_ascii=False) + "\n")
     posts = draft["posts"]
     problems = check(posts)
     if problems:
