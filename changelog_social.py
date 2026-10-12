@@ -73,11 +73,32 @@ def http(method, url, body=None, headers=None, timeout=30):
             return e.code, {"raw": raw.decode(errors="replace")[:500]}
 
 
+class Busy(RuntimeError):
+    """IMD (or GitHub) was overloaded or unreachable for a while. Not our bug; try later."""
+
+
+RETRY_WAITS = (5, 15, 40)  # seconds between attempts when the server says it's busy
+
+
 def get_json(url):
-    status, data = http("GET", url)
-    if status != 200:
+    """GET a JSON document, retrying a few times when the server is busy or unreachable."""
+    last = None
+    for wait in (0, *RETRY_WAITS):
+        if wait:
+            print(f"  server busy ({last}); trying again in {wait}s")
+            time.sleep(wait)
+        try:
+            status, data = http("GET", url)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last = f"network error: {e}"
+            continue
+        if status == 200:
+            return data
+        if status == 429 or status >= 500:
+            last = f"{status}: {data}"
+            continue
         raise RuntimeError(f"GET {url} returned {status}: {data}")
-    return data
+    raise Busy(f"GET {url} still failing after {len(RETRY_WAITS) + 1} tries ({last})")
 
 
 # ---------------------------------------------------------------- find the issue
@@ -341,6 +362,7 @@ def repo_link(path=""):
 PREFIX = "🚨 BREAKING: "
 WARMUP_DAYS = 7          # records only start posting after a week of watching
 MAX_AUTO_PER_DAY = 3     # automatic posts per KST day; approved posts don't count against it
+BUSY_ALERT_AFTER = 6     # busy checks in a row (every 30 min) before Telegram hears about it
 RECORD_COOLDOWN = 24 * 3600
 NICE = (1, 1.5, 2, 2.5, 3, 4, 5, 7.5)
 
@@ -530,10 +552,19 @@ def cmd_watch(args):
     now = int(time.time())
     try:
         snap = snapshot()
-    except NotReady as e:
+    except (NotReady, Busy) as e:
         print(f"Skipping this check: {e}")
+        if st is not None:
+            # Stay quiet through short busy spells; say something once if it lasts ~3 hours.
+            st["busy_runs"] = st.get("busy_runs", 0) + 1
+            if st["busy_runs"] == BUSY_ALERT_AFTER:
+                telegram("ℹ️ CHANGELOG.md watcher: IMD's API has been busy or unreachable for about 3 hours, "
+                         "so breaking-news checks are paused. They pick up again on their own once it's back.")
+            save_json(WATCH, st)
         return 0
     first = st is None
+    if not first and st.pop("busy_runs", 0) >= BUSY_ALERT_AFTER:
+        telegram("✅ CHANGELOG.md watcher: IMD's API is back, checks are running again.")
     if first:
         st = {"startedAt": now, "records": {}, "milestones": {}, "audits_seen": [], "tg_offset": 0}
     st.setdefault("day", {"date": kst_date(), "count": 0})
@@ -630,13 +661,36 @@ def cmd_show(args):
     return 0 if not problems else 1
 
 
+def recent_draft(hours=20):
+    """Issue number of a draft made in the last `hours`, if any (this week's is already done)."""
+    cutoff = time.time() - hours * 3600
+    for p in sorted(DRAFTS.glob("[0-9][0-9][0-9].json"), reverse=True):
+        try:
+            if json.loads(p.read_text()).get("createdAt", 0) > cutoff:
+                return int(p.stem)
+        except Exception:
+            continue
+    return None
+
+
 def cmd_draft(args):
+    if not (args.force or args.test or args.job):
+        done = recent_draft()
+        if done:
+            print(f"This week's draft (No. {done}) is already made; nothing to do.")
+            return 0
     try:
         issue, job = load_issue(args.job or (TEST_JOB_ID if args.test else None))
     except NotReady as e:
         print(f"Not ready yet: {e}")
         if args.notify_not_ready:
             telegram(f"CHANGELOG.md social: no draft yet. {e}.")
+        return 0
+    except Busy as e:
+        print(f"IMD is busy, will try at the next run: {e}")
+        if args.notify_not_ready:
+            telegram("CHANGELOG.md social: couldn't make this week's thread draft because IMD's API was busy. "
+                     f"Run Draft by hand later: {repo_link('/actions/workflows/draft.yml')}")
         return 0
     no = issue["no"]
     path = DRAFTS / f"{no:03d}.json"
