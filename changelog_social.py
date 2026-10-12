@@ -271,7 +271,7 @@ def oauth_signature(method, url, params, consumer_secret, token_secret):
 
 
 def oauth_header(method, url):
-    keys = {k: os.environ.get(k) for k in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET")}
+    keys = {k: (os.environ.get(k) or "").strip() for k in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET")}
     missing = [k for k, v in keys.items() if not v]
     if missing:
         raise RuntimeError(f"missing secrets: {', '.join(missing)}")
@@ -287,6 +287,15 @@ def oauth_header(method, url):
     # JSON bodies are not part of the OAuth 1.0a signature.
     params["oauth_signature"] = oauth_signature(method, url, params, keys["X_API_SECRET"], keys["X_ACCESS_SECRET"])
     return "OAuth " + ", ".join(f'{q(k)}="{q(v)}"' for k, v in sorted(params.items()))
+
+
+def verify_x():
+    """Ask X which account the keys belong to. Read-only; posts nothing."""
+    url = "https://api.x.com/2/users/me"
+    status, data = http("GET", url, headers={"Authorization": oauth_header("GET", url)})
+    if status != 200 or "data" not in data:
+        raise RuntimeError(f"X rejected the keys ({status}): {json.dumps(data)[:300]}")
+    return data["data"].get("username")
 
 
 def tweet(text, reply_to=None):
@@ -684,6 +693,15 @@ def post_issue(no, dry_run=False, force=False, posts=None):
         return 1
     if dry_run:
         print("Dry run, nothing posted:\n\n" + "\n\n".join(posts))
+        if x_ready():
+            try:
+                who = verify_x()
+                print(f"\nX keys work: they post as @{who}")
+                telegram(f"✅ X keys work: they post as @{who}. (Dry run, nothing posted.)")
+            except Exception as e:
+                print(f"\nX key check failed: {e}")
+                telegram(f"⚠️ X key check failed: {e}")
+                return 1
         return 0
     me = os.environ.get("X_HANDLE", "i")
     # Resume a thread that stopped part-way instead of starting it again.
